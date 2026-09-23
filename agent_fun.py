@@ -53,25 +53,34 @@ def llm_json(messages: List[Dict[str, str]]) -> Dict[str, Any]:
     return json.loads(response.message.content)
 
 
-def requested_action(user: str):
+def requested_actions(user: str):
     text = user.lower()
     if "book_recs" in text and any(word in text for word in ("what", "about", "does", "help")):
-        return {"action": "final", "answer": "book_recs searches Open Library for book recommendations by topic and returns titles, authors, and links."}
+        return [{"action": "final", "answer": "book_recs searches Open Library for book recommendations by topic and returns titles, authors, and links."}]
+
+    actions = []
     if any(word in text for word in ("weather", "rain", "temperature", "forecast")):
         coordinates = coordinates_from_text(user)
-        if coordinates:
-            return {"action": "get_weather", "args": {"latitude": coordinates[0], "longitude": coordinates[1]}}
-        return {"action": "final", "answer": "Please share latitude and longitude for the weather report."}
-    if "trivia" in text or "quiz question" in text:
-        return {"action": "trivia", "args": {}}
-    if "joke" in text:
-        return {"action": "random_joke", "args": {}}
-    if "dog" in text and any(word in text for word in ("photo", "picture", "pic", "image")):
-        return {"action": "random_dog", "args": {}}
+        if not coordinates:
+            return [{"action": "final", "answer": "Please share latitude and longitude for the weather report."}]
+        actions.append({"action": "get_weather", "args": {"latitude": coordinates[0], "longitude": coordinates[1]}})
     if "book" in text or "read" in text:
-        topic = re.search(r"(?:about|on|for)\s+(.+?)(?:[?.!]|$)", user, re.IGNORECASE)
-        return {"action": "book_recs", "args": {"topic": topic.group(1) if topic else "weekend reading", "limit": 3}}
-    return None
+        limit_match = re.search(r"\b([1-5])\s+book", text)
+        topic_match = re.search(r"(?:about|on|for)\s+([^,.!?]+)", user, re.IGNORECASE)
+        actions.append({
+            "action": "book_recs",
+            "args": {
+                "topic": topic_match.group(1).strip() if topic_match else "weekend reading",
+                "limit": int(limit_match.group(1)) if limit_match else 3,
+            },
+        })
+    if "joke" in text:
+        actions.append({"action": "random_joke", "args": {}})
+    if "dog" in text and any(word in text for word in ("photo", "picture", "pic", "image")):
+        actions.append({"action": "random_dog", "args": {}})
+    if "trivia" in text or "quiz question" in text:
+        actions.append({"action": "trivia", "args": {}})
+    return actions or None
 
 
 def answer_from_tool(name: str, payload: Dict[str, Any]) -> str:
@@ -153,7 +162,39 @@ async def main():
 
             history.append({"role": "user", "content": user})
             observations: List[str] = []
-            decision = requested_action(user)
+            planned_actions = requested_actions(user)
+
+            if planned_actions:
+                answers = []
+                for decision in planned_actions:
+                    if decision["action"] == "final":
+                        answers.append(decision["answer"])
+                        continue
+
+                    name, args = decision["action"], decision["args"]
+                    try:
+                        payload_text = tool_result(await session.call_tool(name, args))
+                        payload = json.loads(payload_text)
+                    except Exception as exc:
+                        payload = {"error": str(exc)}
+                    observation = json.dumps({"tool": name, "result": payload})
+                    observations.append(observation)
+                    history.append({"role": "user", "content": "Observation: " + observation})
+
+                    if name == "trivia" and "error" not in payload:
+                        active_trivia = payload
+                        choices = payload["incorrect_answers"] + [payload["correct_answer"]]
+                        random.shuffle(choices)
+                        answers.append(payload["question"] + "\nChoices: " + ", ".join(choices))
+                    else:
+                        answers.append(answer_from_tool(name, payload))
+
+                draft = "\n\n".join(answer for answer in answers if answer)
+                print("\nAgent:", reflect(draft, observations))
+                history.append({"role": "assistant", "content": draft})
+                continue
+
+            decision = None
 
             for _ in range(MAX_STEPS):
                 if decision is None:
